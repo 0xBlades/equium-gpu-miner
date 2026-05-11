@@ -53,8 +53,32 @@ pub struct GpuLeafGen {
 
 impl GpuLeafGen {
     pub fn new() -> Result<Self> {
+        // Try Vulkan first, then fall back to GL (OpenGL compute).
+        // The Vulkan backend uses naga → SPIR-V → driver compilation which
+        // can crash on some NVIDIA driver versions. The GL backend uses a
+        // different shader compilation path that avoids the SPIR-V compiler.
+        let backends = [
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::GL,
+        ];
+
+        let mut last_err = anyhow!("no backends to try");
+
+        for backend in &backends {
+            match Self::try_new_with_backend(*backend) {
+                Ok(gpu) => return Ok(gpu),
+                Err(e) => {
+                    eprintln!("Backend {:?} failed: {e:#}", backend);
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    fn try_new_with_backend(backend: wgpu::Backends) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: backend,
             ..Default::default()
         });
 
