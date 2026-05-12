@@ -53,20 +53,22 @@ pub struct GpuLeafGen {
 
 impl GpuLeafGen {
     pub fn new() -> Result<Self> {
-        // Try Vulkan first, then fall back to GL (OpenGL compute).
-        // The Vulkan backend uses naga → SPIR-V → driver compilation which
-        // can crash on some NVIDIA driver versions. The GL backend uses a
-        // different shader compilation path that avoids the SPIR-V compiler.
+        // Linux/headless order: Vulkan first (best compute support on
+        // NVIDIA), then OpenGL compute, then let wgpu auto-pick.
         let backends = [
             wgpu::Backends::VULKAN,
             wgpu::Backends::GL,
+            wgpu::Backends::PRIMARY,
         ];
 
         let mut last_err = anyhow!("no backends to try");
 
         for backend in &backends {
             match Self::try_new_with_backend(*backend) {
-                Ok(gpu) => return Ok(gpu),
+                Ok(gpu) => {
+                    log::info!("Using GPU backend: {:?} - {}", gpu.backend, gpu.adapter_name);
+                    return Ok(gpu);
+                }
                 Err(e) => {
                     eprintln!("Backend {:?} failed: {e:#}", backend);
                     last_err = e;
@@ -82,12 +84,50 @@ impl GpuLeafGen {
             ..Default::default()
         });
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| anyhow!("no compatible GPU adapter found"))?;
+        // On headless Linux servers with NVIDIA GPUs, HighPerformance
+        // sometimes fails because the driver does not expose a power
+        // profile. Try HighPerformance first, then fall back to None.
+        let adapter = pollster::block_on(async {
+            for power in [
+                wgpu::PowerPreference::HighPerformance,
+                wgpu::PowerPreference::None,
+            ] {
+                if let Some(a) = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: power,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                {
+                    return Some(a);
+                }
+            }
+            None
+        })
+        .ok_or_else(|| {
+            let mut msg = format!("no compatible GPU adapter found for backend {:?}", backend);
+            let adapters: Vec<_> = instance.enumerate_adapters(backend).collect();
+            if !adapters.is_empty() {
+                msg.push_str(". Available adapters on this backend:\n");
+                for a in adapters {
+                    let info = a.get_info();
+                    msg.push_str(&format!("  - {} ({:?})\n", info.name, info.device_type));
+                }
+            } else {
+                msg.push_str(". No adapters enumerated for this backend.");
+            }
+            #[cfg(target_os = "linux")]
+            {
+                msg.push_str("\n\nLinux troubleshooting:\n");
+                msg.push_str("  1. Run 'vulkaninfo --summary' to verify Vulkan is installed and sees your GPU.\n");
+                msg.push_str("  2. Ensure the NVIDIA proprietary driver is installed (not nouveau).\n");
+                msg.push_str("  3. Install the Vulkan loader: sudo apt install libvulkan1  (Debian/Ubuntu)\n");
+                msg.push_str("                                sudo dnf install vulkan-loader (Fedora)\n");
+                msg.push_str("  4. Verify ICD exists: ls /usr/share/vulkan/icd.d/nvidia*.json\n");
+            }
+            anyhow!("{}", msg)
+        })?;
 
         let info = adapter.get_info();
         let backend = info.backend;
