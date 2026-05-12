@@ -52,14 +52,50 @@ pub struct GpuLeafGen {
 }
 
 impl GpuLeafGen {
+    fn backend_from_name(name: &str) -> Option<wgpu::Backends> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+            "gl" | "opengl" => Some(wgpu::Backends::GL),
+            "primary" | "auto" => Some(wgpu::Backends::PRIMARY),
+            _ => None,
+        }
+    }
+
+    fn preferred_backends() -> Vec<wgpu::Backends> {
+        if let Ok(raw) = std::env::var("EQUIM_GPU_BACKENDS") {
+            let parsed: Vec<_> = raw
+                .split(',')
+                .filter_map(Self::backend_from_name)
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // NVIDIA 550.x on Linux can segfault inside Vulkan pipeline
+            // compilation. Prefer GL first to avoid that driver path.
+            return vec![
+                wgpu::Backends::GL,
+                wgpu::Backends::VULKAN,
+                wgpu::Backends::PRIMARY,
+            ];
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            vec![
+                wgpu::Backends::VULKAN,
+                wgpu::Backends::GL,
+                wgpu::Backends::PRIMARY,
+            ]
+        }
+    }
+
     pub fn new() -> Result<Self> {
-        // Linux/headless order: Vulkan first (best compute support on
-        // NVIDIA), then OpenGL compute, then let wgpu auto-pick.
-        let backends = [
-            wgpu::Backends::VULKAN,
-            wgpu::Backends::GL,
-            wgpu::Backends::PRIMARY,
-        ];
+        let backends = Self::preferred_backends();
+        log::info!("GPU backend order: {:?}", backends);
 
         let mut last_err = anyhow!("no backends to try");
 
