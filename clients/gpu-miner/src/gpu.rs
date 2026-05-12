@@ -107,7 +107,7 @@ impl GpuLeafGen {
         })
         .ok_or_else(|| {
             let mut msg = format!("no compatible GPU adapter found for backend {:?}", backend);
-            let adapters: Vec<_> = instance.enumerate_adapters(backend).collect();
+            let adapters: Vec<_> = instance.enumerate_adapters(backend).into_iter().collect();
             if !adapters.is_empty() {
                 msg.push_str(". Available adapters on this backend:\n");
                 for a in adapters {
