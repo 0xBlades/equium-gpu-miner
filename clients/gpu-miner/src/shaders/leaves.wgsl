@@ -1,11 +1,19 @@
-// Equihash 96,5 leaf-generation kernel.
+// Equihash 96,5 leaf-generation kernel — compact G-function edition.
 //
-// One invocation = one BLAKE2b call producing 5 leaves of 12 bytes each
-// (n=96, k=5 -> digest_length=60, indices_per_hash=5).
+// One invocation = one BLAKE2b-512 call → 5 leaves × 12 bytes each
+// (n=96, k=5, digest_length=60, indices_per_hash=5).
 //
-// BLAKE2b rounds are fully unrolled with literal SIGMA constants to avoid
-// dynamic indexing into large const arrays, which triggers a segfault in
-// NVIDIA's SPIR-V shader compiler (libnvidia-glvkspirv.so).
+// Root cause of previous segfault (NVIDIA driver 550.x):
+//   libnvidia-glvkspirv.so crashed when compiling a SPIR-V function that
+//   had ~900 inlined operations (the original fully-unrolled main()).
+//
+// Fix: extract blake2b_g() as a separate WGSL function.  naga emits it as
+// a proper SPIR-V OpFunction, so main() becomes 96 call sites instead of
+// 768 inlined instructions.  Byte output is identical — all 12 tests pass.
+//
+// SIGMA permutations are still written as literal block[N] at every call
+// site (no dynamic array indexing), which was the original reason for
+// unrolling.  The function boundary alone is enough to fix the driver bug.
 
 // ---- u64 = vec2<u32> arithmetic ----
 
@@ -86,6 +94,28 @@ fn read_nonce_word(i: u32) -> u32 {
     }
 }
 
+// ---- BLAKE2b G mixing function ----
+//
+// Extracting this as a WGSL function causes naga to emit a proper SPIR-V
+// OpFunction.  main()'s OpFunction body shrinks from ~900 inlined ops to
+// 96 call sites, preventing libnvidia-glvkspirv.so from crashing.
+struct GResult { a: vec2<u32>, b: vec2<u32>, c: vec2<u32>, d: vec2<u32> }
+
+fn blake2b_g(
+    a: vec2<u32>, b: vec2<u32>, c: vec2<u32>, d: vec2<u32>,
+    x: vec2<u32>, y: vec2<u32>,
+) -> GResult {
+    var ra = u64_add(u64_add(a, b), x);
+    var rd = u64_rotr(u64_xor(d, ra), 32u);
+    var rc = u64_add(c, rd);
+    var rb = u64_rotr(u64_xor(b, rc), 24u);
+    ra = u64_add(u64_add(ra, rb), y);
+    rd = u64_rotr(u64_xor(rd, ra), 16u);
+    rc = u64_add(rc, rd);
+    rb = u64_rotr(u64_xor(rb, rc), 63u);
+    return GResult(ra, rb, rc, rd);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let call_idx = gid.x;
@@ -154,821 +184,128 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     v[14] = vec2<u32>(IV6.x ^ 0xffffffffu, IV6.y ^ 0xffffffffu);
     v[15] = IV7;
 
-    // Round 0
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[0]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[1]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[2]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[3]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[4]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[6]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[7]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[8]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[9]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[11]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[12]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[13]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[14]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[15]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // ---- 12 BLAKE2b rounds (96 G calls, literal SIGMA indices) ----
+    var _g: GResult;
 
-    // Round 1
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[14]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[4]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[8]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[9]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[15]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[13]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[6]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[1]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[12]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[0]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[2]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[11]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[7]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[3]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 0: sigma = 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    _g=blake2b_g(v[0],v[4],v[8],v[12],  block[0], block[1]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[2], block[3]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[4], block[5]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[6], block[7]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[8], block[9]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[10],block[11]); v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[12],block[13]); v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[14],block[15]); v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 2
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[11]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[8]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[12]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[0]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[2]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[15]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[13]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[10]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[14]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[3]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[6]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[7]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[1]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[9]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[4]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 1: sigma = 14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[14],block[10]); v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[4], block[8]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[9], block[15]); v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[13],block[6]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[1], block[12]); v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[0], block[2]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[11],block[7]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[5], block[3]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 3
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[7]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[9]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[3]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[1]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[13]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[12]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[11]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[14]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[2]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[6]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[5]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[4]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[0]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[15]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[8]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 2: sigma = 11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[11],block[8]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[12],block[0]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[5], block[2]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[15],block[13]); v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[10],block[14]); v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[3], block[6]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[7], block[1]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[9], block[4]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 4
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[9]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[0]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[5]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[7]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[2]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[4]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[10]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[15]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[14]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[1]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[11]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[12]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[6]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[8]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[3]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[13]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 3: sigma = 7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[7], block[9]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[3], block[1]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[13],block[12]); v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[11],block[14]); v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[2], block[6]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[5], block[10]); v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[4], block[0]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[15],block[8]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 5
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[2]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[12]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[6]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[10]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[0]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[11]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[8]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[3]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[4]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[13]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[7]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[5]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[15]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[14]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[1]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[9]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 4: sigma = 9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[9], block[0]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[5], block[7]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[2], block[4]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[10],block[15]); v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[14],block[1]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[11],block[12]); v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[6], block[8]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[3], block[13]); v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 6
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[12]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[5]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[1]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[15]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[14]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[13]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[4]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[10]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[0]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[7]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[6]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[3]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[9]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[2]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[8]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[11]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 5: sigma = 2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[2], block[12]); v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[6], block[10]); v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[0], block[11]); v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[8], block[3]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[4], block[13]); v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[7], block[5]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[15],block[14]); v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[1], block[9]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 7
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[13]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[11]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[7]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[14]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[12]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[1]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[3]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[9]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[5]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[0]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[15]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[4]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[8]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[6]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[2]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[10]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 6: sigma = 12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[12],block[5]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[1], block[15]); v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[14],block[13]); v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[4], block[10]); v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[0], block[7]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[6], block[3]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[9], block[2]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[8], block[11]); v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 8
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[6]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[15]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[14]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[9]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[11]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[3]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[0]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[8]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[12]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[2]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[13]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[7]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[1]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[4]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[10]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 7: sigma = 13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[13],block[11]); v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[7], block[14]); v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[12],block[1]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[3], block[9]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[5], block[0]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[15],block[4]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[8], block[6]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[2], block[10]); v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 9
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[2]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[8]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[4]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[7]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[6]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[1]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[5]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[15]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[11]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[9]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[14]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[3]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[12]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[13]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[0]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 8: sigma = 6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[6], block[15]); v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[14],block[9]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[11],block[3]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[0], block[8]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[12],block[2]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[13],block[7]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[1], block[4]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[10],block[5]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 10
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[0]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[1]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[2]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[3]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[4]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[6]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[7]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[8]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[9]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[11]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[12]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[13]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[14]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[15]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 9: sigma = 10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[10],block[2]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[8], block[4]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[7], block[6]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[1], block[5]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[15],block[11]); v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[9], block[14]); v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[3], block[12]); v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[13],block[0]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
-    // Round 11
-    // Column step
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[14]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  32u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[4]),  block[10]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[0]),  16u);
-        v[8]  = u64_add(v[8],  v[12]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[8]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[4]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  32u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[5]),  block[8]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[1]),  16u);
-        v[9]  = u64_add(v[9],  v[13]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[9]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[9]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  32u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[6]),  block[15]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[2]),  16u);
-        v[10]  = u64_add(v[10],  v[14]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[10]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[13]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  32u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[7]),  block[6]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[3]),  16u);
-        v[11]  = u64_add(v[11],  v[15]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[11]),  63u);
-    // Diagonal step
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[1]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  32u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  24u);
-        v[0]  = u64_add(u64_add(v[0],  v[5]),  block[12]);
-        v[15]  = u64_rotr(u64_xor(v[15], v[0]),  16u);
-        v[10]  = u64_add(v[10],  v[15]);
-        v[5]  = u64_rotr(u64_xor(v[5], v[10]),  63u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[0]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  32u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  24u);
-        v[1]  = u64_add(u64_add(v[1],  v[6]),  block[2]);
-        v[12]  = u64_rotr(u64_xor(v[12], v[1]),  16u);
-        v[11]  = u64_add(v[11],  v[12]);
-        v[6]  = u64_rotr(u64_xor(v[6], v[11]),  63u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[11]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  32u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  24u);
-        v[2]  = u64_add(u64_add(v[2],  v[7]),  block[7]);
-        v[13]  = u64_rotr(u64_xor(v[13], v[2]),  16u);
-        v[8]  = u64_add(v[8],  v[13]);
-        v[7]  = u64_rotr(u64_xor(v[7], v[8]),  63u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[5]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  32u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  24u);
-        v[3]  = u64_add(u64_add(v[3],  v[4]),  block[3]);
-        v[14]  = u64_rotr(u64_xor(v[14], v[3]),  16u);
-        v[9]  = u64_add(v[9],  v[14]);
-        v[4]  = u64_rotr(u64_xor(v[4], v[9]),  63u);
+    // Round 10: same as round 0 (BLAKE2b sigma repeats mod 10)
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[0], block[1]);  v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[2], block[3]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[4], block[5]);  v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[6], block[7]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[8], block[9]);  v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[10],block[11]); v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[12],block[13]); v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[14],block[15]); v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
+
+    // Round 11: same as round 1
+    _g=blake2b_g(v[0],v[4],v[8],v[12],   block[14],block[10]); v[0]=_g.a;v[4]=_g.b;v[8]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[1],v[5],v[9],v[13],   block[4], block[8]);  v[1]=_g.a;v[5]=_g.b;v[9]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[2],v[6],v[10],v[14],  block[9], block[15]); v[2]=_g.a;v[6]=_g.b;v[10]=_g.c;v[14]=_g.d;
+    _g=blake2b_g(v[3],v[7],v[11],v[15],  block[13],block[6]);  v[3]=_g.a;v[7]=_g.b;v[11]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[0],v[5],v[10],v[15],  block[1], block[12]); v[0]=_g.a;v[5]=_g.b;v[10]=_g.c;v[15]=_g.d;
+    _g=blake2b_g(v[1],v[6],v[11],v[12],  block[0], block[2]);  v[1]=_g.a;v[6]=_g.b;v[11]=_g.c;v[12]=_g.d;
+    _g=blake2b_g(v[2],v[7],v[8],v[13],   block[11],block[7]);  v[2]=_g.a;v[7]=_g.b;v[8]=_g.c;v[13]=_g.d;
+    _g=blake2b_g(v[3],v[4],v[9],v[14],   block[5], block[3]);  v[3]=_g.a;v[4]=_g.b;v[9]=_g.c;v[14]=_g.d;
 
     h[0]  = u64_xor(u64_xor(h[0],  v[0]),  v[8]);
     h[1]  = u64_xor(u64_xor(h[1],  v[1]),  v[9]);
