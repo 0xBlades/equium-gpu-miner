@@ -133,21 +133,43 @@ impl GpuLeafGen {
         let backend = info.backend;
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
 
+        log::info!("Adapter found: {} — requesting device...", adapter_name);
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("equium-gpu-miner"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // Use default desktop limits instead of downlevel (mobile/WebGL)
+                // limits. RTX 4090 is a desktop GPU; downlevel limits can be
+                // unnecessarily restrictive and have caused pipeline issues
+                // on some NVIDIA driver versions.
+                required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
         ))
         .map_err(|e| anyhow!("device init failed: {e:?}"))?;
 
+        log::info!("Device + queue created.");
+
+        // NOTE: If this segfaults on NVIDIA Linux, the crash is almost
+        // certainly inside libnvidia-glvkspirv.so (NVIDIA's SPIR-V
+        // compiler) while translating the large unrolled WGSL kernel.
+        // There is no Rust-side fix for a driver segfault, but the
+        // following workarounds have helped others:
+        //   1. Upgrade to the latest NVIDIA driver (>= 555.x).
+        //   2. Set VK_ICD_FILENAMES explicitly:
+        //        export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+        //   3. Disable the Optimus layer if present:
+        //        export VK_LAYER_DISABLE=VK_LAYER_NV_optimus
+        //   4. Force synchronous shader compilation:
+        //        export __GL_SYNC_TO_VBLANK=0
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("leaves.wgsl"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/leaves.wgsl"))),
         });
+
+        log::info!("Shader module created (WGSL -> SPIR-V compiled successfully).");
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("leaves.bgl"),
@@ -189,6 +211,8 @@ impl GpuLeafGen {
             compilation_options: Default::default(),
             cache: None,
         });
+
+        log::info!("Compute pipeline created successfully.");
 
         Ok(Self {
             device,
@@ -297,11 +321,14 @@ impl GpuLeafGen {
             // One invocation per BLAKE2b call (= 5 leaves).
             let n_calls = (n_leaves + LEAVES_PER_CALL - 1) / LEAVES_PER_CALL;
             let workgroups = (n_calls + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+            log::debug!("Dispatching compute: {} workgroups ({} calls, {} leaves)", workgroups, n_calls, n_leaves);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&storage_buf, 0, &staging, 0, storage_bytes);
+        log::debug!("Submitting command buffer...");
         self.queue.submit(Some(encoder.finish()));
 
+        log::debug!("Waiting for GPU readback...");
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -312,11 +339,13 @@ impl GpuLeafGen {
             .context("readback channel closed")?
             .map_err(|e| anyhow!("staging map failed: {e:?}"))?;
 
+        log::debug!("Copying {} bytes from mapped staging buffer", storage_bytes);
         let data = slice.get_mapped_range();
         out[..storage_bytes as usize].copy_from_slice(&data);
         drop(data);
         staging.unmap();
 
+        log::debug!("GPU leaf generation complete.");
         Ok(())
     }
 }
